@@ -94,12 +94,14 @@
         selectedTask: null,
         selectedGamemode: null,
         newTask: { title: "", description: "", role: ROLES[0], gamemode: "", assignedTo: "", status: "Unfinished" },
-        newGamemode: { title: "", description: "", status: "Unfinished" },
+        // REVERTED: Now uses imageUrl string again
+        newGamemode: { title: "", description: "", status: "Unfinished", imageUrl: "" },
         db: null,
         auth: null,
         userId: null,
         isAuthReady: false,
         isLoading: true,
+        listenersSetup: false, // <-- NEW: Flag to prevent duplicate/premature listener setup
     };
 
     // --- STATE MANAGEMENT AND RENDERING ---
@@ -165,6 +167,7 @@
     
     // --- MODAL CONTROL FUNCTION ---
     function closeModal() {
+        // Always reset authError when closing any modal
         setState({ selectedTask: null, selectedGamemode: null, showAddTask: false, showAddGamemode: false, authError: null });
         document.getElementById('modalsContainer').innerHTML = ''; // Clear modals
     }
@@ -363,6 +366,8 @@
                     <button onclick="closeModal()" class="absolute top-4 right-4 text-slate-400 hover:text-white transition-colors text-2xl font-bold">&times;</button>
                     <h2 class="text-2xl font-bold text-center border-b border-slate-700 pb-3">${task.title}</h2>
 
+                    ${state.authError ? MessageDisplay(state.authError, 'error') : ''}
+
                     <p class="text-sm text-slate-300 whitespace-pre-wrap break-words overflow-y-auto max-h-40 p-2 border border-slate-700 rounded-lg bg-slate-700/50 custom-scroll">
                         <span class="font-medium text-slate-400">Description:</span><br/>
                         ${task.description || 'No description.'}
@@ -437,12 +442,32 @@
         // This variable is used to set the 'selected' attribute on the dropdown options
         const currentStatus = gamemode.status;
         const confirmDeleteId = `confirm-delete-gamemode-${gamemode.id}`;
+        
+        // Use imageUrl if present, otherwise fall back to base64Image (for old docs)
+        const imageSource = gamemode.imageUrl || gamemode.base64Image; 
+
+        const imageHtml = imageSource && imageSource.trim() !== '' ? `
+            <div class="p-2 rounded-xl bg-slate-700/50">
+                <p class="font-medium text-slate-400 text-sm mb-2">Concept Art / Screenshot:</p>
+                <img 
+                    src="${imageSource}" 
+                    alt="Gamemode concept art" 
+                    class="w-full h-auto object-cover max-h-60 rounded-lg shadow-xl border border-slate-600"
+                    onerror="this.onerror=null; this.src='https://placehold.co/400x200/334155/ffffff?text=Image+Load+Failed';"
+                >
+            </div>
+        ` : '';
 
         const modalHtml = `
             <div id="gamemodeDetailsModal" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
                 <div class="bg-slate-800 p-6 rounded-2xl w-full max-w-md space-y-4 shadow-2xl relative">
                     <button onclick="closeModal()" class="absolute top-4 right-4 text-slate-400 hover:text-white transition-colors text-2xl font-bold">&times;</button>
                     <h2 class="2xl font-bold text-center border-b border-slate-700 pb-3">${gamemode.title}</h2>
+
+                    <!-- Display error message if present -->
+                    ${state.authError ? MessageDisplay(state.authError, 'error') : ''}
+                    
+                    ${imageHtml}
 
                     <p class="text-sm text-slate-300 whitespace-pre-wrap break-words overflow-y-auto max-h-40 p-2 border border-slate-700 rounded-lg bg-slate-700/50 custom-scroll">
                         <span class="font-medium text-slate-400">Description:</span><br/>
@@ -549,6 +574,15 @@
 
                     <input type="text" placeholder="Gamemode Title (e.g., Laser Tag)" id="newGamemodeTitle" value="${state.newGamemode.title}" class="w-full p-3 rounded-xl bg-slate-700 border border-slate-600 focus:border-cyan-500 focus:ring-cyan-500" />
                     <textarea placeholder="Description (e.g., 2 teams, capture the flag style)" id="newGamemodeDescription" class="w-full p-3 rounded-xl bg-slate-700 border border-slate-600 h-24 focus:border-cyan-500 focus:ring-cyan-500">${state.newGamemode.description}</textarea>
+                    
+                    <!-- REVERTED: URL Input for image link -->
+                    <input 
+                        type="url" 
+                        placeholder="Image URL (e.g., https://i.imgur.com/concept.png)" 
+                        id="newGamemodeImageUrl" 
+                        value="${state.newGamemode.imageUrl}" 
+                        class="w-full p-3 rounded-xl bg-slate-700 border border-slate-600 focus:border-cyan-500 focus:ring-cyan-500" 
+                    />
 
                     <div class="flex justify-between pt-4">
                         <button id="cancelAddGamemodeBtn" class="px-5 py-2 rounded-full bg-slate-600 hover:bg-slate-500 transform transition-all shadow-lg text-sm">Cancel</button>
@@ -659,6 +693,7 @@
 
         const titleEl = document.getElementById('newGamemodeTitle');
         const descriptionEl = document.getElementById('newGamemodeDescription');
+        const imageUrlEl = document.getElementById('newGamemodeImageUrl'); // REVERTED: Get URL element
         const submitBtn = document.getElementById('submitAddGamemodeBtn');
         
         const title = titleEl.value.trim();
@@ -666,12 +701,14 @@
             setState({ authError: "Gamemode title is required." });
             return;
         }
-
+        
         // Prepare data outside of try block
         const gamemodeData = { 
             title, 
             description: descriptionEl.value, 
             status: "Unfinished", 
+            // REVERTED: Save imageUrl string
+            imageUrl: imageUrlEl.value.trim() || "", 
             createdAt: Date.now() 
         };
         const gamemodesCollectionRef = collection(state.db, getCollectionPath('gamemodes'));
@@ -683,7 +720,8 @@
 
             // 2. Reset form state and CLOSE MODAL INSTANTLY (Optimistic Closure)
             setState({ 
-                newGamemode: { title: "", description: "", status: "Unfinished" },
+                // REVERTED: Reset imageUrl
+                newGamemode: { title: "", description: "", status: "Unfinished", imageUrl: "" },
                 showAddGamemode: false, // <-- This is the key change for instant closure
                 authError: null
             });
@@ -697,7 +735,7 @@
             console.error("Error adding gamemode, re-opening modal:", e);
             setState({ 
                 showAddGamemode: true, // Re-open modal
-                authError: `Failed to add gamemode. Please check connection. Error: ${e.message}` 
+                authError: `Failed to add gamemode. Error: ${e.message}` 
             });
         } finally {
              // This button might be null since the modal is closed, but it's safe to check.
@@ -708,28 +746,34 @@
         }
     }
 
-    // --- UPDATE HANDLERS (No Change) ---
+    // --- UPDATE HANDLERS ---
     async function updateTaskStatus(id, status) {
         if ((state.userRole !== 'Owner' && state.userRole !== 'Dev') || !state.db) return;
+        
+        // Clear previous error on attempt
+        state.authError = null;
+
         try {
             const taskRef = doc(state.db, getCollectionPath('tasks'), id);
             await updateDoc(taskRef, { status: status });
             console.log(`Task ${id} status updated to ${status}.`);
             
-            // 1. Update the local copy of the selected task to the new status
+            // Optimistic UI update for speed
             const taskIndex = state.tasks.findIndex(t => t.id === id);
             if (taskIndex !== -1) {
                 state.tasks[taskIndex].status = status;
             }
             
-            // 2. Ensure the selectedTask object used by the modal has the new status
             if (state.selectedTask && state.selectedTask.id === id) {
                 state.selectedTask.status = status;
-                // 3. Force the modal to redraw with the updated state
+                // Force modal redraw with new status and clear any old error
                 renderTaskDetailsModal(); 
             }
         } catch (e) {
             console.error("Error updating task status:", e);
+            // Set error to display in the modal
+            state.authError = `Failed to update status: ${e.message}`;
+            renderTaskDetailsModal(); // Re-render modal to show error
         }
     }
 
@@ -742,30 +786,39 @@
             closeModal();
         } catch (e) {
             console.error("Error deleting task:", e);
+            // On delete failure, show error in the modal
+            state.authError = `Failed to delete task: ${e.message}`;
+            renderTaskDetailsModal();
         }
     }
 
     async function updateGamemodeStatus(id, status) {
         if ((state.userRole !== 'Owner' && state.userRole !== 'Dev') || !state.db) return;
+
+        // Clear previous error on attempt
+        state.authError = null;
+
         try {
             const gamemodeRef = doc(state.db, getCollectionPath('gamemodes'), id);
             await updateDoc(gamemodeRef, { status: status });
             console.log(`Gamemode ${id} status updated to ${status}.`);
             
-            // 1. Update the local copy of the selected gamemode to the new status
+            // Optimistic UI update for speed
             const gamemodeIndex = state.gamemodes.findIndex(g => g.id === id);
             if (gamemodeIndex !== -1) {
                 state.gamemodes[gamemodeIndex].status = status;
             }
 
-            // 2. Ensure the selectedGamemode object used by the modal has the new status
             if (state.selectedGamemode && state.selectedGamemode.id === id) {
                 state.selectedGamemode.status = status;
-                // 3. Force the modal to redraw with the updated state
+                // Force the modal to redraw with the updated status and clear any old error
                 renderGamemodeDetailsModal();
             }
         } catch (e) {
             console.error("Error updating gamemode status:", e);
+            // Set error to display in the modal
+            state.authError = `Failed to update status: ${e.message}`;
+            renderGamemodeDetailsModal(); // Re-render modal to show error
         }
     }
 
@@ -778,10 +831,13 @@
             closeModal();
         } catch (e) {
             console.error("Error deleting gamemode:", e);
+             // On delete failure, show error in the modal
+            state.authError = `Failed to delete gamemode: ${e.message}`;
+            renderGamemodeDetailsModal();
         }
     }
 
-    // --- INITIALIZATION AND LISTENERS (No Change) ---
+    // --- INITIALIZATION AND LISTENERS (Fix applied here) ---
 
     async function initFirebase() {
         try {
@@ -829,14 +885,17 @@
                 state.userId = user ? user.uid : 'unauthenticated-' + crypto.randomUUID();
                 console.log("Auth State Changed. Current User ID:", state.userId);
                 
+                // FIX: Only setup listeners if a user is authenticated AND they haven't been setup yet.
+                // This ensures we wait for the authenticated state before attempting data access.
+                if (user && state.db && !state.listenersSetup) {
+                    setupFirestoreListeners();
+                    state.listenersSetup = true; // Prevents duplicate listeners
+                    console.log("Firestore listeners initialized after successful authentication.");
+                }
+
                 // Note: userRole remains null here, forcing the client-side password check.
 
                 setState({ isAuthReady: true, isLoading: false });
-                
-                // Start listening to data only once auth is ready
-                if (state.isAuthReady && state.db) {
-                    setupFirestoreListeners();
-                }
             });
 
             await signIn();
@@ -880,7 +939,7 @@
         });
     }
 
-    // --- EVENT ATTACHMENT (No Change) ---
+    // --- EVENT ATTACHMENT ---
 
     function attachEventListeners() {
         // Sign-in screen listeners
@@ -933,7 +992,7 @@
                 document.querySelectorAll('.gamemode-item').forEach(item => {
                     item.onclick = () => {
                         const gamemodeId = item.dataset.gamemodeId;
-                        const gamemode = state.gamemodes.find(g => t.id === gamemodeId);
+                        const gamemode = state.gamemodes.find(g => g.id === gamemodeId); // Fixed the t.id to g.id
                         if (gamemode) setState({ selectedGamemode: gamemode });
                     };
                 });
@@ -963,7 +1022,7 @@
     }
 
     function attachAddGamemodeEventListeners() {
-        const inputs = ['Title', 'Description'];
+        const inputs = ['Title', 'Description', 'ImageUrl']; // REVERTED: Added ImageUrl
         inputs.forEach(key => {
             const el = document.getElementById(`newGamemode${key}`);
             if (el) {
