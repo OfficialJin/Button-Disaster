@@ -1,0 +1,988 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BD Dev Hub - Project Management</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Font Setup -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a; /* slate-900 */
+        }
+        /* Custom scrollbar for better aesthetics */
+        .custom-scroll::-webkit-scrollbar {
+            width: 8px;
+        }
+        .custom-scroll::-webkit-scrollbar-thumb {
+            background-color: #475569; /* slate-600 */
+            border-radius: 4px;
+        }
+        .custom-scroll::-webkit-scrollbar-track {
+            background-color: #1e293b; /* slate-800 */
+        }
+    </style>
+</head>
+<body>
+
+<div id="app" class="min-h-screen">
+    <!-- Content will be rendered here by JavaScript -->
+</div>
+
+<script type="module">
+    // --- FIREBASE IMPORTS ---
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { 
+        getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged 
+    } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { 
+        getFirestore, collection, onSnapshot, addDoc, doc, updateDoc, deleteDoc, setLogLevel
+    } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // --- CONSTANTS ---
+    const ROLES = ["VFX", "Scripting", "Building", "UI", "SFX", "Animation"];
+    const STATUS_OPTIONS = ["Unfinished", "Finished", "Canceled"];
+    
+    // Passwords for local role-based access
+    const OWNER_PASSWORD = "BDDH";
+    const DEV_PASSWORD = "developer";
+
+    // --- FIREBASE CONFIGURATION LOGIC ---
+    // External configuration fallback (used if not running in a supported Canvas environment)
+    const EXTERNAL_CONFIG = {
+        apiKey: "AIzaSyB0nUMqT1zab7_fUwy0AZ9yHlVxWiN5gNk", 
+        authDomain: "button-disasters.firebaseapp.com",
+        projectId: "button-disasters",
+        storageBucket: "button-disasters.firebasestorage.app",
+        messagingSenderId: "119713660227",
+        appId: "1:119713660227:web:50f0c62c0d16dd8caa43f6",
+        measurementId: "G-HX5JLJE8B4",
+    };
+
+    const canvasAppId = typeof __app_id !== 'undefined' ? __app_id : null;
+    const canvasConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+    const canvasToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+    const useExternalConfig = !canvasConfig || !canvasAppId;
+
+    const finalAppId = useExternalConfig ? EXTERNAL_CONFIG.projectId : canvasAppId;
+    const finalFirebaseConfig = useExternalConfig ? EXTERNAL_CONFIG : canvasConfig;
+
+    // Define the correct path prefix based on the environment
+    const FIRESTORE_PATH_PREFIX = useExternalConfig 
+      ? '' // External projects use the collection root (e.g., /tasks)
+      : `/artifacts/${finalAppId}/public/data`;
+      
+    const getCollectionPath = (collectionName) => {
+        // Builds path: e.g., '/artifacts/id/public/data/tasks' or just 'tasks'
+        return `${FIRESTORE_PATH_PREFIX}${FIRESTORE_PATH_PREFIX ? '/' : ''}${collectionName}`;
+    };
+
+    // --- GLOBAL STATE ---
+    let state = {
+        userRole: null, // null means user must sign in
+        authError: null,
+        tab: "Roles",
+        roleTab: ROLES[0],
+        tasks: [],
+        gamemodes: [],
+        showAddTask: false,
+        showAddGamemode: false,
+        selectedTask: null,
+        selectedGamemode: null,
+        newTask: { title: "", description: "", role: ROLES[0], gamemode: "", assignedTo: "", status: "Unfinished" },
+        newGamemode: { title: "", description: "", status: "Unfinished" },
+        db: null,
+        auth: null,
+        userId: null,
+        isAuthReady: false,
+        isLoading: true,
+    };
+
+    // --- STATE MANAGEMENT AND RENDERING ---
+    function setState(newState) {
+        Object.assign(state, newState);
+        renderApp();
+    }
+
+    function renderApp() {
+        const appContainer = document.getElementById('app');
+        if (!appContainer) return;
+
+        if (state.isLoading) {
+            appContainer.innerHTML = renderLoadingScreen();
+        } else if (!state.userRole) {
+            // If authentication is ready but no role is set, show sign-in
+            appContainer.innerHTML = renderSignInScreen();
+            attachEventListeners();
+        } else {
+            // If user has a role, show main UI
+            appContainer.innerHTML = renderMainUI();
+            attachEventListeners();
+            
+            // Re-render modals if they are open (since they are part of the main UI HTML output)
+            if (state.selectedTask) renderTaskDetailsModal();
+            if (state.selectedGamemode) renderGamemodeDetailsModal();
+            if (state.showAddTask) renderAddTaskModal();
+            if (state.showAddGamemode) renderAddGamemodeModal();
+        }
+    }
+
+    // --- UI HELPER FUNCTIONS ---
+
+    function getTaskStatusClass(status) {
+        if (status === 'Finished') return 'bg-green-700 hover:bg-green-600';
+        if (status === 'Canceled') return 'bg-red-700 hover:bg-red-600';
+        return 'bg-slate-700 hover:bg-slate-600';
+    }
+
+    function getGamemodeStatusClass(status) {
+        if (status === 'Finished') return 'bg-green-800/70';
+        if (status === 'Canceled') return 'bg-red-800/70';
+        return 'bg-slate-700';
+    }
+
+    function getTasksByRole(role) {
+        return state.tasks.filter((t) => t.role === role);
+    }
+
+    function MessageDisplay(message, type = 'error') {
+        const bgColor = type === 'error' ? 'bg-red-800' : 'bg-yellow-600';
+        return `
+            <div id="message-display" class="p-3 rounded-xl mb-4 text-sm font-semibold ${bgColor}">
+                <div class="flex justify-between items-center">
+                    <span>${message}</span>
+                    <button onclick="document.getElementById('message-display').remove()" class="text-white opacity-70 hover:opacity-100 font-bold p-1 rounded-full">
+                        &times;
+                    </button>
+                </div>
+            </div>
+        `;
+    }
+    
+    // --- MODAL CONTROL FUNCTION ---
+    function closeModal() {
+        setState({ selectedTask: null, selectedGamemode: null, showAddTask: false, showAddGamemode: false, authError: null });
+        document.getElementById('modalsContainer').innerHTML = ''; // Clear modals
+    }
+    // Expose closeModal to the global window object so it can be called from inline HTML event handlers (e.g., onclick="closeModal()")
+    window.closeModal = closeModal; 
+    
+    // --- VIEW RENDERING FUNCTIONS ---
+
+    function renderLoadingScreen() {
+        return `
+            <div class="min-h-screen flex items-center justify-center bg-slate-900 text-slate-100 p-4">
+                <div class="text-xl font-bold text-cyan-400">Loading Dev Hub... (Check Console for Debug Info)</div>
+            </div>
+        `;
+    }
+    
+    function renderSignInScreen() {
+        return `
+            <div class="min-h-screen flex items-center justify-center bg-slate-900 text-slate-100 p-4">
+                <div class="w-full max-w-md bg-slate-800 p-8 rounded-2xl shadow-2xl space-y-6">
+                    <h2 class="text-3xl font-extrabold text-center text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-pink-500">
+                        BD Dev Hub Login
+                    </h2>
+                    <p class="text-center text-slate-400 text-sm">Enter the Owner or Developer password to continue.</p>
+                    
+                    ${state.authError ? MessageDisplay(state.authError, 'error') : ''}
+
+                    <input 
+                        type="password" 
+                        id="passwordInput" 
+                        placeholder="Enter Password" 
+                        class="w-full p-4 rounded-xl bg-slate-700 border border-slate-600 text-white focus:border-cyan-500 focus:ring-cyan-500" 
+                    />
+                    
+                    <button 
+                        id="signInButton" 
+                        class="w-full px-6 py-3 rounded-full bg-gradient-to-r from-cyan-500 to-pink-500 transform transition-all hover:scale-[1.01] hover:translate-y-[-1px] shadow-lg font-bold text-lg"
+                    >
+                        Sign In
+                    </button>
+                    
+                    <p class="text-center text-xs text-slate-500 pt-2">
+                        Authenticated User ID: ${state.userId || 'N/A'}
+                    </p>
+                </div>
+            </div>
+        `;
+    }
+
+    function renderMainUI() {
+        const isOwner = state.userRole === 'Owner';
+        const tasksForRole = getTasksByRole(state.roleTab);
+
+        return `
+            <div class="min-h-screen bg-slate-900 text-slate-100 p-6 font-sans">
+                <div class="max-w-6xl mx-auto">
+                    <div class="flex justify-between items-center mb-6 border-b border-slate-700 pb-4">
+                        <h1 class="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-pink-500 leading-tight tracking-wide">
+                            BD Dev Hub
+                        </h1>
+                        <div class="text-right space-y-1">
+                            <p class="text-sm font-bold p-1 px-3 rounded-full ${isOwner ? 'bg-yellow-600 text-yellow-50' : 'bg-indigo-600 text-indigo-50'}">
+                                Role: ${state.userRole || 'Dev'}
+                            </p>
+                            <p class="text-[10px] text-slate-400">
+                                User ID: ${state.userId}
+                            </p>
+                            <button id="signOutButton" class="text-xs text-slate-400 hover:text-red-400 transition-colors mt-1">
+                                (Sign Out)
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Primary Tab Navigation -->
+                    <div class="flex flex-wrap justify-center gap-4 mb-8 p-1 rounded-full bg-slate-800 shadow-xl">
+                        ${["Roles", "Gamemodes"].map(t => `
+                            <button
+                                data-tab="${t}"
+                                class="tab-button px-6 py-3 rounded-full transition-all transform font-semibold text-lg ${
+                                    state.tab === t 
+                                      ? 'bg-gradient-to-r from-cyan-500 to-pink-500 shadow-md shadow-pink-500/30' 
+                                      : 'bg-transparent hover:bg-slate-700'
+                                }"
+                            >
+                                ${t}
+                            </button>
+                        `).join('')}
+                    </div>
+
+                    <!-- Tab Content -->
+                    <div id="tabContent">
+                        ${state.tab === "Roles" ? `
+                            <!-- Roles Tab Content -->
+                            <div class="bg-slate-800 p-6 rounded-3xl shadow-2xl">
+                                <!-- Secondary Role Navigation -->
+                                <div class="flex flex-wrap gap-2 mb-6 justify-center border-b border-slate-700 pb-4 custom-scroll overflow-x-auto">
+                                    ${ROLES.map(r => `
+                                        <button
+                                            data-role-tab="${r}"
+                                            class="role-tab-button flex-shrink-0 px-4 py-2 rounded-full transition-transform transform hover:scale-105 font-medium text-sm ${
+                                                state.roleTab === r ? 'bg-gradient-to-r from-indigo-500 to-cyan-400 shadow-md' : 'bg-slate-700 hover:bg-slate-600'
+                                            }"
+                                        >
+                                            ${r} (${getTasksByRole(r).length})
+                                        </button>
+                                    `).join('')}
+                                </div>
+
+                                ${isOwner ? `
+                                    <div class="text-center mb-6">
+                                        <button
+                                            id="showAddTaskButton"
+                                            class="px-6 py-3 rounded-full bg-gradient-to-r from-cyan-500 to-pink-500 transform transition-all hover:scale-105 hover:translate-y-[-2px] shadow-lg font-bold"
+                                        >
+                                            + Add New Task for ${state.roleTab}
+                                        </button>
+                                    </div>
+                                ` : ''}
+
+                                <ul class="grid sm:grid-cols-2 md:col-span-3 lg:grid-cols-3 gap-3">
+                                    ${tasksForRole.length === 0 ? `
+                                        <li class="text-slate-400 text-center sm:col-span-2 md:col-span-3 p-4">
+                                            No tasks currently assigned to ${state.roleTab}.
+                                        </li>
+                                    ` : (
+                                        tasksForRole.map(t => `
+                                            <li
+                                                data-task-id="${t.id}"
+                                                class="task-item p-4 rounded-xl cursor-pointer transition-all transform hover:scale-[1.02] shadow-md ${getTaskStatusClass(t.status)}"
+                                            >
+                                                <p class="font-bold break-words leading-tight max-w-full text-lg">${t.title}</p>
+                                                <p class="text-xs text-slate-300 mt-1">${t.gamemode || 'N/A'} — <span class="font-semibold">${t.assignedTo || 'Unassigned'}</span></p>
+                                                <span class="text-xs font-bold mt-2 inline-block rounded-full px-2 py-0.5 bg-slate-900/50">${t.status}</span>
+                                            </li>
+                                        `).join('')
+                                    )}
+                                </ul>
+                            </div>
+                        ` : `
+                            <!-- Gamemodes Tab Content -->
+                            <div class="bg-slate-800 p-6 rounded-3xl shadow-2xl">
+                                ${isOwner ? `
+                                    <div class="text-center mb-6">
+                                        <button
+                                            id="showAddGamemodeButton"
+                                            class="px-6 py-3 rounded-full bg-gradient-to-r from-cyan-500 to-pink-500 transform transition-all hover:scale-105 hover:translate-y-[-2px] shadow-lg font-bold"
+                                        >
+                                            + Add New Gamemode
+                                        </button>
+                                    </div>
+                                ` : ''}
+
+                                ${state.gamemodes.length === 0 ? `
+                                    <p class="text-center text-slate-400 p-4">No gamemodes yet. Add one to start tracking related tasks.</p>
+                                ` : `
+                                    <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                        ${state.gamemodes.map(g => `
+                                            <div
+                                                data-gamemode-id="${g.id}"
+                                                class="gamemode-item p-5 rounded-2xl cursor-pointer hover:bg-slate-700 transition-all transform hover:scale-[1.01] shadow-lg ${getGamemodeStatusClass(g.status)}"
+                                            >
+                                                <h3 class="text-xl font-bold mb-1 leading-tight">${g.title}</h3>
+                                                <p class="text-xs text-slate-400 mb-3">Tasks: ${state.tasks.filter(t => t.gamemode === g.title).length}</p>
+                                                <p class="text-sm text-slate-300 mb-2 whitespace-pre-wrap max-h-20 overflow-hidden line-clamp-3">${g.description || 'No description provided.'}</p>
+                                                <p class="text-xs font-bold text-cyan-300">Status: ${g.status}</p>
+                                            </div>
+                                        `).join('')}
+                                    </div>
+                                `}
+                            </div>
+                        `}
+                    </div>
+                </div>
+
+                <!-- Modals will be rendered here via JS functions attached to document.body -->
+                <div id="modalsContainer"></div>
+            </div>
+        `;
+    }
+
+    function renderTaskDetailsModal() {
+        const task = state.selectedTask;
+        if (!task) return;
+
+        const isOwner = state.userRole === 'Owner';
+        const canDelete = isOwner;
+        const canEditStatus = isOwner || state.userRole === 'Dev';
+        
+        // This variable is used to set the 'selected' attribute on the dropdown options
+        const currentStatus = task.status; 
+        const confirmDeleteId = `confirm-delete-task-${task.id}`;
+
+        const modalHtml = `
+            <div id="taskDetailsModal" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
+                <div class="bg-slate-800 p-6 rounded-2xl w-full max-w-md space-y-4 shadow-2xl relative">
+                    <button onclick="closeModal()" class="absolute top-4 right-4 text-slate-400 hover:text-white transition-colors text-2xl font-bold">&times;</button>
+                    <h2 class="text-2xl font-bold text-center border-b border-slate-700 pb-3">${task.title}</h2>
+
+                    <p class="text-sm text-slate-300 whitespace-pre-wrap break-words overflow-y-auto max-h-40 p-2 border border-slate-700 rounded-lg bg-slate-700/50 custom-scroll">
+                        <span class="font-medium text-slate-400">Description:</span><br/>
+                        ${task.description || 'No description.'}
+                    </p>
+
+                    <p class="text-sm text-slate-400">
+                        **Role:** ${task.role}
+                    </p>
+                    <p class="text-sm text-slate-400">
+                        **Assigned to:** ${task.assignedTo || 'Unassigned'}
+                    </p>
+                    <p class="text-sm text-slate-400">
+                        **Gamemode:** ${task.gamemode || 'N/A'}
+                    </p>
+
+                    <label class="block text-sm font-medium text-slate-400">
+                        Update Status: ${canEditStatus ? '' : '(View Only)'}
+                    </label>
+                    <select 
+                      id="taskStatusSelect"
+                      ${!canEditStatus ? 'disabled' : ''}
+                      class="w-full p-2 rounded bg-slate-700 text-white shadow-inner ${canEditStatus ? 'focus:ring-cyan-500 focus:ring-1' : 'opacity-50 cursor-not-allowed'}"
+                    >
+                      <!-- The selected attribute here ensures the dropdown defaults to the currentStatus -->
+                      ${STATUS_OPTIONS.map(s => `<option value="${s}" ${s === currentStatus ? 'selected' : ''}>${s}</option>`).join('')}
+                    </select>
+
+                    <div class="flex justify-between pt-4">
+                      ${canDelete ? `
+                        <button id="deleteTaskBtn" class="px-4 py-2 rounded-full bg-gradient-to-r from-red-600 to-red-800 hover:scale-[1.02] transform transition-all shadow-lg text-sm">
+                          Delete Task
+                        </button>
+                      ` : '<div />'}
+                      <button onclick="closeModal()" class="px-4 py-2 rounded-full bg-slate-700 hover:bg-slate-600 transform transition-all shadow-lg text-sm">
+                        Close
+                      </button>
+                    </div>
+
+                    <!-- Custom Confirmation Modal -->
+                    <div id="${confirmDeleteId}" class="absolute inset-0 bg-slate-900 bg-opacity-95 flex flex-col items-center justify-center rounded-2xl p-6 space-y-4 hidden">
+                        <p class="text-lg font-bold text-red-400">Confirm Deletion</p>
+                        <p class="text-center text-sm">Are you sure you want to permanently delete "${task.title}"?</p>
+                        <div class="flex gap-4">
+                          <button id="confirmDeleteTaskBtn" class="px-5 py-2 rounded-full bg-red-600 hover:bg-red-500 transition-all">Yes, Delete</button>
+                          <button onclick="document.getElementById('${confirmDeleteId}').classList.add('hidden')" class="px-5 py-2 rounded-full bg-slate-600 hover:bg-slate-500 transition-all">Cancel</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.getElementById('modalsContainer').innerHTML = modalHtml;
+        
+        // Attach event listeners for the modal
+        if (canEditStatus) {
+            // NOTE: The listener is attached here every time the modal re-renders
+            document.getElementById('taskStatusSelect').onchange = (e) => updateTaskStatus(task.id, e.target.value);
+        }
+        if (canDelete) {
+            document.getElementById('deleteTaskBtn').onclick = () => document.getElementById(confirmDeleteId).classList.remove('hidden');
+            document.getElementById('confirmDeleteTaskBtn').onclick = () => handleDeleteTask(task.id);
+        }
+    }
+
+    function renderGamemodeDetailsModal() {
+        const gamemode = state.selectedGamemode;
+        if (!gamemode) return;
+
+        const isOwner = state.userRole === 'Owner';
+        const canDelete = isOwner;
+        const canEditStatus = isOwner || state.userRole === 'Dev';
+        
+        // This variable is used to set the 'selected' attribute on the dropdown options
+        const currentStatus = gamemode.status;
+        const confirmDeleteId = `confirm-delete-gamemode-${gamemode.id}`;
+
+        const modalHtml = `
+            <div id="gamemodeDetailsModal" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
+                <div class="bg-slate-800 p-6 rounded-2xl w-full max-w-md space-y-4 shadow-2xl relative">
+                    <button onclick="closeModal()" class="absolute top-4 right-4 text-slate-400 hover:text-white transition-colors text-2xl font-bold">&times;</button>
+                    <h2 class="2xl font-bold text-center border-b border-slate-700 pb-3">${gamemode.title}</h2>
+
+                    <p class="text-sm text-slate-300 whitespace-pre-wrap break-words overflow-y-auto max-h-40 p-2 border border-slate-700 rounded-lg bg-slate-700/50 custom-scroll">
+                        <span class="font-medium text-slate-400">Description:</span><br/>
+                        ${gamemode.description || 'No description.'}
+                    </p>
+
+                    <label class="block text-sm font-medium text-slate-400">
+                        Update Status: ${canEditStatus ? '' : '(View Only)'}
+                    </label>
+                    <select 
+                      id="gamemodeStatusSelect"
+                      ${!canEditStatus ? 'disabled' : ''}
+                      class="w-full p-2 rounded bg-slate-700 text-white shadow-inner ${canEditStatus ? 'focus:ring-cyan-500 focus:ring-1' : 'opacity-50 cursor-not-allowed'}"
+                    >
+                      <!-- The selected attribute here ensures the dropdown defaults to the currentStatus -->
+                      ${STATUS_OPTIONS.map(s => `<option value="${s}" ${s === currentStatus ? 'selected' : ''}>${s}</option>`).join('')}
+                    </select>
+
+                    <div class="flex justify-between pt-4">
+                      ${canDelete ? `
+                        <button id="deleteGamemodeBtn" class="px-4 py-2 rounded-full bg-gradient-to-r from-red-600 to-red-800 hover:scale-[1.02] transform transition-all shadow-lg text-sm">
+                          Delete Gamemode
+                        </button>
+                      ` : '<div />'}
+                      <button onclick="closeModal()" class="px-4 py-2 rounded-full bg-slate-700 hover:bg-slate-600 transform transition-all shadow-lg text-sm">
+                        Close
+                      </button>
+                    </div>
+
+                    <!-- Custom Confirmation Modal -->
+                    <div id="${confirmDeleteId}" class="absolute inset-0 bg-slate-900 bg-opacity-95 flex flex-col items-center justify-center rounded-2xl p-6 space-y-4 hidden">
+                        <p class="text-lg font-bold text-red-400">Confirm Deletion</p>
+                        <p class="text-center text-sm">Are you sure you want to delete "${gamemode.title}"? Tasks referencing it will keep the name.</p>
+                        <div class="flex gap-4">
+                          <button id="confirmDeleteGamemodeBtn" class="px-5 py-2 rounded-full bg-red-600 hover:bg-red-500 transition-all">Yes, Delete</button>
+                          <button onclick="document.getElementById('${confirmDeleteId}').classList.add('hidden')" class="px-5 py-2 rounded-full bg-slate-600 hover:bg-slate-500 transition-all">Cancel</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.getElementById('modalsContainer').innerHTML = modalHtml;
+
+        // Attach event listeners for the modal
+        if (canEditStatus) {
+            // NOTE: The listener is attached here every time the modal re-renders
+            document.getElementById('gamemodeStatusSelect').onchange = (e) => updateGamemodeStatus(gamemode.id, e.target.value);
+        }
+        if (canDelete) {
+            document.getElementById('deleteGamemodeBtn').onclick = () => document.getElementById(confirmDeleteId).classList.remove('hidden');
+            document.getElementById('confirmDeleteGamemodeBtn').onclick = () => handleDeleteGamemode(gamemode.id);
+        }
+    }
+
+    function renderAddTaskModal() {
+        if (state.userRole !== 'Owner') return;
+        
+        const error = state.authError; // Reusing authError for general modal errors
+
+        const modalHtml = `
+            <div id="addTaskModal" class="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 p-4">
+                <div class="bg-slate-800 p-6 rounded-2xl w-full max-w-md space-y-4 shadow-2xl relative">
+                    <button onclick="closeModal()" class="absolute top-4 right-4 text-slate-400 hover:text-white transition-colors text-2xl font-bold">&times;</button>
+                    <h2 class="text-2xl font-bold text-center mb-2">Add Task (Owner Only)</h2>
+
+                    ${error ? MessageDisplay(error, 'error') : ''}
+
+                    <input type="text" placeholder="Task Title (e.g., Implement Healthbar UI)" id="newTaskTitle" value="${state.newTask.title}" class="w-full p-3 rounded-xl bg-slate-700 border border-slate-600 focus:border-cyan-500 focus:ring-cyan-500" />
+                    <textarea placeholder="Task Description (what it should look like)" id="newTaskDescription" class="w-full p-3 rounded-xl bg-slate-700 border border-slate-600 h-24 focus:border-cyan-500 focus:ring-cyan-500">${state.newTask.description}</textarea>
+                    <input type="text" placeholder="Assigned To (person's name)" id="newTaskAssignedTo" value="${state.newTask.assignedTo}" class="w-full p-3 rounded-xl bg-slate-700 border border-slate-600 focus:border-cyan-500 focus:ring-cyan-500" />
+
+                    <select id="newTaskRole" class="w-full p-3 rounded-xl bg-slate-700 border border-slate-600 focus:border-cyan-500 focus:ring-cyan-500">
+                        ${ROLES.map(r => `<option value="${r}" ${r === state.newTask.role ? 'selected' : ''}>${r}</option>`).join('')}
+                    </select>
+
+                    <select id="newTaskGamemode" class="w-full p-3 rounded-xl bg-slate-700 border border-slate-600 focus:border-cyan-500 focus:ring-cyan-500">
+                        <option value="">Gamemode: N/A</option>
+                        ${state.gamemodes.map(g => `<option value="${g.title}" ${g.title === state.newTask.gamemode ? 'selected' : ''}>${g.title}</option>`).join('')}
+                    </select>
+
+                    <div class="flex justify-between pt-4">
+                        <button id="cancelAddTaskBtn" class="px-5 py-2 rounded-full bg-slate-600 hover:bg-slate-500 transform transition-all shadow-lg text-sm">Cancel</button>
+                        <button id="submitAddTaskBtn" class="px-5 py-2 rounded-full bg-gradient-to-r from-cyan-500 to-pink-500 hover:scale-[1.02] transform transition-all shadow-lg text-sm">Add Task</button>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.getElementById('modalsContainer').innerHTML = modalHtml;
+        attachAddTaskEventListeners();
+    }
+
+    function renderAddGamemodeModal() {
+        if (state.userRole !== 'Owner') return;
+        
+        const error = state.authError; // Reusing authError for general modal errors
+
+        const modalHtml = `
+            <div id="addGamemodeModal" class="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 p-4">
+                <div class="bg-slate-800 p-6 rounded-2xl w-full max-w-md space-y-4 shadow-2xl relative">
+                    <button onclick="closeModal()" class="absolute top-4 right-4 text-slate-400 hover:text-white transition-colors text-2xl font-bold">&times;</button>
+                    <h2 class="2xl font-bold text-center mb-2">Add Gamemode (Owner Only)</h2>
+
+                    ${error ? MessageDisplay(error, 'error') : ''}
+
+                    <input type="text" placeholder="Gamemode Title (e.g., Laser Tag)" id="newGamemodeTitle" value="${state.newGamemode.title}" class="w-full p-3 rounded-xl bg-slate-700 border border-slate-600 focus:border-cyan-500 focus:ring-cyan-500" />
+                    <textarea placeholder="Description (e.g., 2 teams, capture the flag style)" id="newGamemodeDescription" class="w-full p-3 rounded-xl bg-slate-700 border border-slate-600 h-24 focus:border-cyan-500 focus:ring-cyan-500">${state.newGamemode.description}</textarea>
+
+                    <div class="flex justify-between pt-4">
+                        <button id="cancelAddGamemodeBtn" class="px-5 py-2 rounded-full bg-slate-600 hover:bg-slate-500 transform transition-all shadow-lg text-sm">Cancel</button>
+                        <button id="submitAddGamemodeBtn" class="px-5 py-2 rounded-full bg-gradient-to-r from-cyan-500 to-pink-500 hover:scale-[1.02] transform transition-all shadow-lg text-sm">Add Gamemode</button>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.getElementById('modalsContainer').innerHTML = modalHtml;
+        attachAddGamemodeEventListeners();
+    }
+    
+    // --- AUTH AND FIRESTORE HANDLERS ---
+
+    function handleSignIn() {
+        const password = document.getElementById('passwordInput').value;
+        let role = null;
+
+        if (password === OWNER_PASSWORD) {
+            role = 'Owner';
+        } else if (password === DEV_PASSWORD) {
+            role = 'Dev';
+        }
+
+        if (role) {
+            // Success: set the role and clear any error
+            setState({ userRole: role, authError: null });
+            console.log("Sign In Successful. Role:", role);
+        } else {
+            // Failure: show error and clear password field
+            document.getElementById('passwordInput').value = '';
+            setState({ authError: "Invalid password. Please try again." });
+            console.warn("Sign In Failed. Invalid Password.");
+        }
+    }
+
+    function handleSignOut() {
+        // Clear the userRole to force the sign-in screen to display on next render
+        setState({ userRole: null, authError: null });
+        console.log("Signed Out. Returning to login screen.");
+    }
+
+    // --- OPTIMISTIC CLOSURE FIX: Modal closes before awaiting addDoc ---
+    async function handleAddTask() {
+        if (state.userRole !== 'Owner' || !state.db) return;
+        
+        const titleEl = document.getElementById('newTaskTitle');
+        const descriptionEl = document.getElementById('newTaskDescription');
+        const assignedToEl = document.getElementById('newTaskAssignedTo');
+        const roleEl = document.getElementById('newTaskRole');
+        const gamemodeEl = document.getElementById('newTaskGamemode');
+        const submitBtn = document.getElementById('submitAddTaskBtn');
+
+        const title = titleEl.value.trim();
+        if (!title) {
+            setState({ authError: "Task title is required." });
+            return;
+        }
+
+        // Prepare data outside of try block
+        const taskData = { 
+            title, 
+            description: descriptionEl.value, 
+            assignedTo: assignedToEl.value, 
+            role: roleEl.value, 
+            gamemode: gamemodeEl.value || "N/A", 
+            status: "Unfinished", 
+            createdAt: Date.now() 
+        };
+        const tasksCollectionRef = collection(state.db, getCollectionPath('tasks'));
+        
+        try {
+            // 1. Show immediate UI feedback
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Saving...';
+
+            // 2. Reset form state and CLOSE MODAL INSTANTLY (Optimistic Closure)
+            // We set newTaks back to empty state for the next time the modal opens.
+            setState({ 
+                newTask: { title: "", description: "", role: ROLES[0], gamemode: "", assignedTo: "", status: "Unfinished" },
+                showAddTask: false, // <-- This is the key change for instant closure
+                authError: null 
+            });
+
+            // 3. Wait for the potentially slow Firestore operation to complete
+            await addDoc(tasksCollectionRef, taskData);
+            
+            console.log("Task successfully added (Optimistic UI successful).");
+        } catch (e) {
+            // 4. HANDLE FAILURE: Re-open the modal and show error if save failed
+            console.error("Error adding task, re-opening modal:", e);
+            setState({ 
+                showAddTask: true, // Re-open modal
+                authError: `Failed to add task. Please check connection. Error: ${e.message}` 
+            });
+        } finally {
+            // This button might be null since the modal is closed, but it's safe to check.
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Add Task';
+            }
+        }
+    }
+
+    // --- OPTIMISTIC CLOSURE FIX: Modal closes before awaiting addDoc ---
+    async function handleAddGamemode() {
+        if (state.userRole !== 'Owner' || !state.db) return;
+
+        const titleEl = document.getElementById('newGamemodeTitle');
+        const descriptionEl = document.getElementById('newGamemodeDescription');
+        const submitBtn = document.getElementById('submitAddGamemodeBtn');
+        
+        const title = titleEl.value.trim();
+        if (!title) {
+            setState({ authError: "Gamemode title is required." });
+            return;
+        }
+
+        // Prepare data outside of try block
+        const gamemodeData = { 
+            title, 
+            description: descriptionEl.value, 
+            status: "Unfinished", 
+            createdAt: Date.now() 
+        };
+        const gamemodesCollectionRef = collection(state.db, getCollectionPath('gamemodes'));
+
+        try {
+            // 1. Show immediate UI feedback
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Saving...';
+
+            // 2. Reset form state and CLOSE MODAL INSTANTLY (Optimistic Closure)
+            setState({ 
+                newGamemode: { title: "", description: "", status: "Unfinished" },
+                showAddGamemode: false, // <-- This is the key change for instant closure
+                authError: null
+            });
+
+            // 3. Wait for the potentially slow Firestore operation to complete
+            await addDoc(gamemodesCollectionRef, gamemodeData);
+            
+            console.log("Gamemode successfully added (Optimistic UI successful).");
+        } catch (e) {
+             // 4. HANDLE FAILURE: Re-open the modal and show error if save failed
+            console.error("Error adding gamemode, re-opening modal:", e);
+            setState({ 
+                showAddGamemode: true, // Re-open modal
+                authError: `Failed to add gamemode. Please check connection. Error: ${e.message}` 
+            });
+        } finally {
+             // This button might be null since the modal is closed, but it's safe to check.
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Add Gamemode';
+            }
+        }
+    }
+
+    // --- UPDATE HANDLERS (No Change) ---
+    async function updateTaskStatus(id, status) {
+        if ((state.userRole !== 'Owner' && state.userRole !== 'Dev') || !state.db) return;
+        try {
+            const taskRef = doc(state.db, getCollectionPath('tasks'), id);
+            await updateDoc(taskRef, { status: status });
+            console.log(`Task ${id} status updated to ${status}.`);
+            
+            // 1. Update the local copy of the selected task to the new status
+            const taskIndex = state.tasks.findIndex(t => t.id === id);
+            if (taskIndex !== -1) {
+                state.tasks[taskIndex].status = status;
+            }
+            
+            // 2. Ensure the selectedTask object used by the modal has the new status
+            if (state.selectedTask && state.selectedTask.id === id) {
+                state.selectedTask.status = status;
+                // 3. Force the modal to redraw with the updated state
+                renderTaskDetailsModal(); 
+            }
+        } catch (e) {
+            console.error("Error updating task status:", e);
+        }
+    }
+
+    async function handleDeleteTask(id) {
+        if (state.userRole !== 'Owner' || !state.db) return;
+        try {
+            const taskRef = doc(state.db, getCollectionPath('tasks'), id);
+            await deleteDoc(taskRef);
+            console.log(`Task ${id} deleted.`);
+            closeModal();
+        } catch (e) {
+            console.error("Error deleting task:", e);
+        }
+    }
+
+    async function updateGamemodeStatus(id, status) {
+        if ((state.userRole !== 'Owner' && state.userRole !== 'Dev') || !state.db) return;
+        try {
+            const gamemodeRef = doc(state.db, getCollectionPath('gamemodes'), id);
+            await updateDoc(gamemodeRef, { status: status });
+            console.log(`Gamemode ${id} status updated to ${status}.`);
+            
+            // 1. Update the local copy of the selected gamemode to the new status
+            const gamemodeIndex = state.gamemodes.findIndex(g => g.id === id);
+            if (gamemodeIndex !== -1) {
+                state.gamemodes[gamemodeIndex].status = status;
+            }
+
+            // 2. Ensure the selectedGamemode object used by the modal has the new status
+            if (state.selectedGamemode && state.selectedGamemode.id === id) {
+                state.selectedGamemode.status = status;
+                // 3. Force the modal to redraw with the updated state
+                renderGamemodeDetailsModal();
+            }
+        } catch (e) {
+            console.error("Error updating gamemode status:", e);
+        }
+    }
+
+    async function handleDeleteGamemode(id) {
+        if (state.userRole !== 'Owner' || !state.db) return;
+        try {
+            const gamemodeRef = doc(state.db, getCollectionPath('gamemodes'), id);
+            await deleteDoc(gamemodeRef);
+            console.log(`Gamemode ${id} deleted.`);
+            closeModal();
+        } catch (e) {
+            console.error("Error deleting gamemode:", e);
+        }
+    }
+
+    // --- INITIALIZATION AND LISTENERS (No Change) ---
+
+    async function initFirebase() {
+        try {
+            if (Object.keys(finalFirebaseConfig).length === 0 || finalFirebaseConfig.projectId === 'your-project-id') {
+                console.error("Firebase config is missing or using placeholder. Cannot initialize Firebase.");
+                setState({ isLoading: false });
+                return;
+            }
+            
+            // Set Firestore debug level to help diagnose connection/permission errors
+            setLogLevel('Debug'); 
+            
+            // Log Configuration for debugging
+            console.log("--- FIREBASE DEBUG CONFIGURATION ---");
+            console.log("App ID:", finalAppId);
+            console.log("Using Canvas Config:", !useExternalConfig);
+            console.log("Base Firestore Path Prefix:", FIRESTORE_PATH_PREFIX || "(Root - External)");
+            console.log("Example Task Collection Path:", getCollectionPath('tasks'));
+            console.log("--- FIREBASE DEBUG CONFIGURATION END ---");
+
+
+            const app = initializeApp(finalFirebaseConfig);
+            const firestore = getFirestore(app);
+            const authInstance = getAuth(app);
+
+            state.db = firestore;
+            state.auth = authInstance;
+
+            const signIn = async () => {
+                try {
+                    if (canvasToken) {
+                        await signInWithCustomToken(authInstance, canvasToken);
+                        console.log("Auth: Signed in with custom token.");
+                    } else {
+                        await signInAnonymously(authInstance);
+                        console.log("Auth: Signed in anonymously.");
+                    }
+                } catch (error) {
+                    console.error("Firebase Auth sign-in failed. Please check the __initial_auth_token and Firebase configuration/rules.", error);
+                    state.userId = 'anonymous-' + crypto.randomUUID();
+                }
+            };
+
+            onAuthStateChanged(authInstance, (user) => {
+                state.userId = user ? user.uid : 'unauthenticated-' + crypto.randomUUID();
+                console.log("Auth State Changed. Current User ID:", state.userId);
+                
+                // Note: userRole remains null here, forcing the client-side password check.
+
+                setState({ isAuthReady: true, isLoading: false });
+                
+                // Start listening to data only once auth is ready
+                if (state.isAuthReady && state.db) {
+                    setupFirestoreListeners();
+                }
+            });
+
+            await signIn();
+
+        } catch (e) {
+            console.error("General Firebase setup error. Check if the SDKs loaded correctly.", e);
+            setState({ isLoading: false });
+        }
+    }
+
+    function setupFirestoreListeners() {
+        const tasksCollectionRef = collection(state.db, getCollectionPath('tasks'));
+        const gamemodesCollectionRef = collection(state.db, getCollectionPath('gamemodes'));
+
+        console.log("Setting up Task listener for path:", getCollectionPath('tasks'));
+        onSnapshot(tasksCollectionRef, (snapshot) => {
+            const fetchedTasks = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+            // Sort by createdAt descending
+            fetchedTasks.sort((a, b) => b.createdAt - a.createdAt);
+            console.log("Tasks data received:", fetchedTasks.length, "tasks.");
+            setState({ tasks: fetchedTasks });
+        }, (error) => {
+            console.error("FIRESTORE ERROR: Failed to listen to tasks. This is often a security rule issue or incorrect path.", error);
+        });
+
+        console.log("Setting up Gamemode listener for path:", getCollectionPath('gamemodes'));
+        onSnapshot(gamemodesCollectionRef, (snapshot) => {
+            const fetchedGamemodes = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+             // Sort by createdAt descending
+            fetchedGamemodes.sort((a, b) => b.createdAt - a.createdAt);
+            console.log("Gamemodes data received:", fetchedGamemodes.length, "gamemodes.");
+            setState({ gamemodes: fetchedGamemodes });
+        }, (error) => {
+            console.error("FIRESTORE ERROR: Failed to listen to gamemodes. This is often a security rule issue or incorrect path.", error);
+        });
+    }
+
+    // --- EVENT ATTACHMENT (No Change) ---
+
+    function attachEventListeners() {
+        // Sign-in screen listeners
+        if (!state.userRole) {
+            const signInBtn = document.getElementById('signInButton');
+            const passwordInput = document.getElementById('passwordInput');
+
+            if (signInBtn) signInBtn.onclick = handleSignIn;
+            if (passwordInput) {
+                passwordInput.onkeyup = (e) => {
+                    if (e.key === 'Enter') {
+                        handleSignIn();
+                    }
+                };
+            }
+        }
+        
+        // --- Main UI Listeners (Active when logged in) ---
+        if (state.userRole) {
+            document.getElementById('signOutButton').onclick = handleSignOut;
+
+            // Primary Tab Navigation
+            document.querySelectorAll('.tab-button').forEach(btn => {
+                btn.onclick = () => setState({ tab: btn.dataset.tab });
+            });
+
+            if (state.tab === "Roles") {
+                // Secondary Role Navigation
+                document.querySelectorAll('.role-tab-button').forEach(btn => {
+                    btn.onclick = () => setState({ roleTab: btn.dataset.roleTab });
+                });
+                // Task List click handlers
+                document.querySelectorAll('.task-item').forEach(item => {
+                    item.onclick = () => {
+                        const taskId = item.dataset.taskId;
+                        const task = state.tasks.find(t => t.id === taskId);
+                        if (task) setState({ selectedTask: task });
+                    };
+                });
+                // Add Task button
+                const addTaskBtn = document.getElementById('showAddTaskButton');
+                if (addTaskBtn) addTaskBtn.onclick = () => setState({ 
+                    showAddTask: true, 
+                    // Set the role default to the currently selected tab role
+                    newTask: {...state.newTask, role: state.roleTab} 
+                });
+
+            } else if (state.tab === "Gamemodes") {
+                // Gamemode List click handlers
+                document.querySelectorAll('.gamemode-item').forEach(item => {
+                    item.onclick = () => {
+                        const gamemodeId = item.dataset.gamemodeId;
+                        const gamemode = state.gamemodes.find(g => t.id === gamemodeId);
+                        if (gamemode) setState({ selectedGamemode: gamemode });
+                    };
+                });
+                // Add Gamemode button
+                const addGamemodeBtn = document.getElementById('showAddGamemodeButton');
+                if (addGamemodeBtn) addGamemodeBtn.onclick = () => setState({ showAddGamemode: true });
+            }
+        }
+    }
+    
+    function attachAddTaskEventListeners() {
+        const inputs = ['Title', 'Description', 'AssignedTo', 'Role', 'Gamemode'];
+        inputs.forEach(key => {
+            const el = document.getElementById(`newTask${key}`);
+            if (el) {
+                el.oninput = (e) => {
+                    // Update state.newTask based on input changes
+                    const propName = key.charAt(0).toLowerCase() + key.slice(1);
+                    const updatedNewTask = { ...state.newTask, [propName]: e.target.value };
+                    state.newTask = updatedNewTask; // Direct state modification for inputs is okay before submission
+                };
+            }
+        });
+
+        document.getElementById('cancelAddTaskBtn').onclick = closeModal;
+        document.getElementById('submitAddTaskBtn').onclick = handleAddTask;
+    }
+
+    function attachAddGamemodeEventListeners() {
+        const inputs = ['Title', 'Description'];
+        inputs.forEach(key => {
+            const el = document.getElementById(`newGamemode${key}`);
+            if (el) {
+                el.oninput = (e) => {
+                    // Update state.newGamemode based on input changes
+                    const propName = key.charAt(0).toLowerCase() + key.slice(1);
+                    const updatedNewGamemode = { ...state.newGamemode, [propName]: e.target.value };
+                    state.newGamemode = updatedNewGamemode; // Direct state modification for inputs is okay before submission
+                };
+            }
+        });
+
+        document.getElementById('cancelAddGamemodeBtn').onclick = closeModal;
+        document.getElementById('submitAddGamemodeBtn').onclick = handleAddGamemode;
+    }
+
+    // Initialize application on window load
+    window.onload = initFirebase;
+
+</script>
+</body>
+</html>
